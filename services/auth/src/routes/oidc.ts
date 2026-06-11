@@ -48,9 +48,20 @@ export async function oidcRoutes(app: FastifyInstance, baas: BaasClient): Promis
     if (!accessToken) {
       return reply.status(401).send({ error: 'unauthorized', error_description: 'Missing access credentials.' })
     }
+    let payload: any
+    
+    try {
+      // Isolate token verification to correctly return a 401 on validation errors
+      payload = await verifyAccessToken(accessToken)
+    } catch (err) {
+      request.log.error({ err }, 'Access token verification failed')
+      return reply.status(401).send({ 
+        error: 'invalid_token', 
+        error_description: 'Invalid or expired access token.' 
+      })
+    }
 
     try {
-      const payload = await verifyAccessToken(accessToken)
       const userId = payload.sub
 
       if (!userId) {
