@@ -75,7 +75,7 @@ flows, never store passwords, and never issue their own tokens.
 
 ### Monorepo, Modular Services
 
-All services live in a single monorepo (managed with pnpm workspaces). Each service
+All services live in a single monorepo (managed with npm workspaces). Each service
 is independently deployable as a Docker container. They share TypeScript types and
 utility libraries via internal workspace packages but have no shared runtime state.
 
@@ -85,8 +85,7 @@ This architecture is designed for a growing product — not a toy, not a Fortune
 enterprise. Defaults are chosen to be operationally simple on a VPS while leaving
 clear upgrade paths as traffic grows.
 
-- Single primary Postgres instance with read replica (not a cluster — yet)
-- Redis single node (Sentinel when you need HA)
+- **Spur Connect** as the unified data layer (SQL, NoSQL, KV, Storage, Auth, Realtime)
 - Nginx as the reverse proxy / TLS terminator (not a full service mesh)
 - Docker Compose on each VPS node (Kubernetes is the upgrade path)
 - GitHub Actions for CI/CD
@@ -101,7 +100,7 @@ clear upgrade paths as traffic grows.
 |-----------------|------------------------------|----------|--------------------------------------------------|
 | Language        | TypeScript (strict mode)     | 5.x      | Type safety across the full codebase             |
 | Runtime         | Node.js LTS                  | 22.x     | Long-term support, native ESM, solid crypto APIs |
-| Package manager | pnpm                         | 9.x      | Fast, disk-efficient, workspace support          |
+| Package manager | npm                          | 10.x     | Workspace support; lockfile in repo              |
 | Module format   | ESM (`"type": "module"`)     | —        | Native imports, no CommonJS interop debt         |
 
 ### 3.2 Web Framework
@@ -120,39 +119,156 @@ await app.register(import('./routes/index.js'))
 await app.listen({ port: 3000, host: '0.0.0.0' })
 ```
 
-### 3.3 Database
+### 3.3 Database & Data Layer — Spur Connect
 
-| Package            | Version | Rationale                                                    |
-|--------------------|---------|--------------------------------------------------------------|
-| **postgresql**     | 16.x    | ACID, robust JSON support, full-text search, battle-tested   |
-| **drizzle-orm**    | latest  | TypeScript-native, zero-overhead SQL builder, explicit migrations |
-| **drizzle-kit**    | latest  | Migration tooling for Drizzle ORM                            |
+All data access (SQL, NoSQL, KV, file storage) goes through **Spur Connect**
+(`@spurs-baas/sdk`). This is the project's unified BaaS layer. There is no direct
+Postgres driver, no Redis client, and no ORM in service code — all data operations
+use the `BaasClient`.
+
+| Module             | Backing store   | Use                                                       |
+|--------------------|-----------------|-----------------------------------------------------------|
+| `baas.db(table)`   | PostgreSQL      | Relational data — users, sessions, app domain records     |
+| `baas.nosql(col)`  | MongoDB         | Document data — flexible schemas, nested objects          |
+| `baas.kv`          | MongoDB KV      | Ephemeral key-value — rate limits, session metadata, flags |
+| `baas.storage(bucket)` | MinIO       | File uploads — presigned PUT/GET, never proxied           |
+| `baas.auth`        | Spur Auth       | Project-scoped user auth (used by `accounts-ui` only)     |
+| `baas.realtime`    | Socket.io       | Change subscriptions on SQL tables and NoSQL collections  |
+| `baas.functions`   | Edge functions  | Async/remote work invoked from services                   |
+
+**SDK package:** `@spurs-baas/sdk`  
+**Backend URL:** `https://bass-backend.onrender.com` (set via `BAAS_BASE_URL`)
 
 ```typescript
-// Drizzle schema example
-import { pgTable, uuid, text, timestamp } from 'drizzle-orm/pg-core'
+// Standard client initialisation — one instance per service
+import { BaasClient } from '@spurs-baas/sdk'
 
-export const users = pgTable('users', {
-  id:        uuid('id').primaryKey().defaultRandom(),
-  email:     text('email').notNull().unique(),
-  createdAt: timestamp('created_at').defaultNow().notNull(),
+const baas = new BaasClient({
+  projectId: process.env.BAAS_PROJECT_ID!,
+  apiKey:    process.env.BAAS_API_KEY!,
+  baseUrl:   process.env.BAAS_BASE_URL,   // falls back to BAAS_BASE_URL env var
 })
 ```
 
-Migrations live in `/services/auth/src/db/migrations/` and are run via:
+#### SQL (PostgreSQL via Spur Connect)
 
-```bash
-pnpm --filter @app/auth db:migrate
+```typescript
+// Query
+const { data } = await baas.db('users')
+  .select('id, email, created_at')
+  .filter('status', 'eq', 'active')
+  .order('created_at', 'desc')
+  .limit(20)
+  .execute()
+
+// Insert
+const user = await baas.db('users').insert({ email: 'a@b.com', status: 'active' })
+
+// Update
+await baas.db('users').update(userId, { status: 'suspended' })
+
+// Delete
+await baas.db('users').delete(userId)
+
+// Single row
+const row = await baas.db('users').getById(userId)
+
+// Postgres function (RPC)
+const results = await baas.db.rpc('search_users').call({ query: 'alice' })
 ```
 
-### 3.4 Caching & Session Store
+Schema migrations are managed through the Spur Connect dashboard.
+There is no `db:migrate` script in service code.
 
-| Package     | Version | Use                                                               |
-|-------------|---------|-------------------------------------------------------------------|
-| **redis**   | 7.x     | Refresh token store, rate limit counters, session revocation list |
-| **ioredis** | latest  | TypeScript Redis client with cluster/sentinel support             |
+#### NoSQL (MongoDB via Spur Connect)
 
-### 3.5 Authentication Libraries
+```typescript
+// Find with filter
+const { data } = await baas.nosql('audit_logs')
+  .find({ userId, event: 'login' })
+  .sort({ createdAt: -1 })
+  .limit(50)
+  .execute()
+
+// Insert
+const doc = await baas.nosql('audit_logs').insertOne({ userId, event: 'login', ip })
+
+// Update (auto-wraps plain objects in $set)
+await baas.nosql('audit_logs').updateOne(docId, { resolved: true })
+
+// Aggregation pipeline
+const stats = await baas.nosql('events').aggregate([
+  { $match: { type: 'auth.failure' } },
+  { $group: { _id: '$ip', count: { $sum: 1 } } },
+])
+```
+
+#### Key-Value Store
+
+```typescript
+// Rate limit counter (TTL-based)
+await baas.kv.set(`rate:login:${ip}`, count, { ttl: 900 })
+const hits = await baas.kv.get(`rate:login:${ip}`)
+
+// Revocation flag
+await baas.kv.set(`revoked:${tokenId}`, '1', { ttl: remainingLifetime })
+const isRevoked = await baas.kv.get(`revoked:${tokenId}`)
+
+// Batch operations
+await baas.kv.batch([
+  { op: 'set', key: 'a', value: 1 },
+  { op: 'get', key: 'b' },
+  { op: 'delete', key: 'c' },
+])
+```
+
+#### File Storage
+
+```typescript
+// Get a presigned upload URL (file goes directly to storage, never through the server)
+const { uploadUrl, fileUrl } = await baas.storage('avatars').upload({
+  filename:    'profile.jpg',
+  contentType: 'image/jpeg',
+})
+await fetch(uploadUrl, { method: 'PUT', body: fileBlob })
+// fileUrl is the permanent download URL
+
+// List files
+const files = await baas.storage('docs').listFiles({ prefix: 'reports/' })
+
+// Presigned download URL
+const { url } = await baas.storage('docs').getDownloadUrl('report.pdf', { expiresIn: 300 })
+```
+
+#### Realtime
+
+```typescript
+// Subscribe to SQL table changes
+const unsub = baas.realtime.on('sessions', (event) => {
+  console.log(event.type, event.record) // INSERT | UPDATE | DELETE
+})
+
+// Subscribe to NoSQL collection changes
+const unsub2 = baas.realtime.onCollection('audit_logs', handler, {
+  eventTypes: ['INSERT'],
+})
+
+// Unsubscribe
+unsub()
+baas.destroy() // closes Socket.io connection on shutdown
+```
+
+#### Edge Functions
+
+```typescript
+// Invoke a named function
+const result = await baas.functions
+  .invoke('send-email')
+  .with({ to: 'user@example.com', subject: 'Verify your email', templateId: 'verify' })
+  .call()
+```
+
+### 3.4 Authentication Libraries (gateway service only)
 
 | Package             | Version | Purpose                                                   |
 |---------------------|---------|-----------------------------------------------------------|
@@ -161,7 +277,11 @@ pnpm --filter @app/auth db:migrate
 | **argon2**          | latest  | Password hashing — Argon2id, winner of the PHC            |
 | **@simplewebauthn** | latest  | Passkey / WebAuthn enrolment and assertion                |
 
-### 3.6 Validation & Schemas
+> Note: `baas.auth` (Spur Connect's built-in auth module) is used only by
+> `apps/accounts-ui` for project-scoped end-user sessions. The gateway's own
+> identity operations (JWT signing, Argon2, TOTP) remain in `services/auth`.
+
+### 3.5 Validation & Schemas
 
 | Package       | Version | Use                                                                  |
 |---------------|---------|----------------------------------------------------------------------|
@@ -171,18 +291,18 @@ pnpm --filter @app/auth db:migrate
 Zod schemas are the single source of truth. They are compiled to JSON Schema for
 Fastify and exported as TypeScript types for the frontend.
 
-### 3.7 Messaging / Event Bus
+### 3.6 Messaging / Event Bus
 
 | Package       | Version | Rationale                                                      |
 |---------------|---------|----------------------------------------------------------------|
 | **bullmq**    | latest  | Redis-backed job queue; reliable, retryable background workers |
-| **ioredis**   | latest  | Also used for Redis Pub/Sub between services                   |
 
-For a growing product on a VPS, BullMQ over Redis is the right call — no separate
-broker to operate. The upgrade path to RabbitMQ or Kafka is straightforward when
-needed.
+BullMQ connects to the Redis instance managed by Spur Connect under the hood via
+the project's KV store for lightweight signals, or directly via `REDIS_URL` for
+the worker queue if a dedicated Redis is provisioned. The upgrade path to
+RabbitMQ or Kafka is straightforward when needed.
 
-### 3.8 Observability
+### 3.7 Observability
 
 | Package / Tool                  | Version | Purpose                                         |
 |---------------------------------|---------|-------------------------------------------------|
@@ -192,7 +312,7 @@ needed.
 | **prom-client**                 | latest  | Prometheus metrics endpoint (`/metrics`)        |
 | **Grafana + Prometheus**        | latest  | Dashboards and alerting on the VPS              |
 
-### 3.9 Frontend
+### 3.8 Frontend
 
 | Package          | Version | Rationale                                            |
 |------------------|---------|------------------------------------------------------|
@@ -204,7 +324,7 @@ needed.
 The login / registration UI lives at `accounts.yourdomain.com` and is served by the
 gateway's own Next.js frontend package (`/apps/accounts-ui`).
 
-### 3.10 Developer Tooling
+### 3.9 Developer Tooling
 
 | Package / Tool      | Version | Use                                              |
 |---------------------|---------|--------------------------------------------------|
@@ -212,7 +332,6 @@ gateway's own Next.js frontend package (`/apps/accounts-ui`).
 | **prettier**        | 3.x     | Code formatting                                  |
 | **vitest**          | 2.x     | Unit and integration tests                       |
 | **supertest**       | latest  | HTTP integration tests against Fastify           |
-| **testcontainers**  | latest  | Spin up real Postgres + Redis for integration tests |
 | **Docker**          | 27.x    | Containerisation for all services                |
 | **Docker Compose**  | 2.x     | Local dev and VPS deployment orchestration       |
 | **GitHub Actions**  | —       | CI/CD pipelines                                  |
@@ -223,7 +342,8 @@ gateway's own Next.js frontend package (`/apps/accounts-ui`).
 
 ### 4.1 Node Topology
 
-For a medium-scale product, the recommended starting layout is **3 VPS nodes**:
+For a medium-scale product, the recommended starting layout is **2 VPS nodes**
+(Spur Connect manages the data tier externally):
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -238,19 +358,19 @@ For a medium-scale product, the recommended starting layout is **3 VPS nodes**:
 │  Certbot (Let's Encrypt auto-renewal)                   │
 │  Fail2ban (brute-force protection)                      │
 │  UFW firewall                                           │
-└──────────┬──────────────────────────┬───────────────────┘
-           │ internal network          │ internal network
-           ▼                          ▼
-┌──────────────────────┐   ┌──────────────────────────────┐
-│  VPS-2: App Server   │   │  VPS-3: Data Server           │
-│                      │   │                               │
-│  Docker Compose:     │   │  PostgreSQL 16 (primary)      │
-│  - gateway (auth)    │   │  PostgreSQL 16 (read replica) │
-│  - api-service       │   │  Redis 7                      │
-│  - worker-service    │   │  Backups → remote storage     │
-│  - accounts-ui       │   │                               │
-│                      │   │  UFW: only VPS-2 has access   │
-└──────────────────────┘   └──────────────────────────────┘
+└──────────┬──────────────────────────────────────────────┘
+           │ internal network
+           ▼
+┌──────────────────────┐     ┌──────────────────────────────┐
+│  VPS-2: App Server   │     │  Spur Connect (external)      │
+│                      │     │                               │
+│  Docker Compose:     │────►│  PostgreSQL (SQL)             │
+│  - gateway (auth)    │     │  MongoDB (NoSQL + KV)         │
+│  - api-service       │     │  MinIO (Storage)              │
+│  - worker-service    │     │  Socket.io (Realtime)         │
+│  - accounts-ui       │     │  Edge Functions               │
+│                      │     │  Auth module                  │
+└──────────────────────┘     └──────────────────────────────┘
 ```
 
 **VPS recommendations (starting point):**
@@ -259,11 +379,9 @@ For a medium-scale product, the recommended starting layout is **3 VPS nodes**:
 |--------|-----------------------------------------|------------------------|
 | VPS-1  | Hetzner CX22, DigitalOcean Droplet      | 2 vCPU, 4 GB RAM       |
 | VPS-2  | Hetzner CX32, Contabo VPS M             | 4 vCPU, 8 GB RAM       |
-| VPS-3  | Hetzner CX32, Contabo VPS M             | 4 vCPU, 8 GB RAM, SSD  |
 
-All three nodes must be in the **same datacenter region** and connected via a private
-network (Hetzner's private network, DigitalOcean VPC, etc.) so inter-node traffic is
-never exposed to the public internet.
+All nodes must be in the **same datacenter region** and connected via a private
+network so inter-node traffic is never exposed to the public internet.
 
 ### 4.2 DNS Layout
 
@@ -324,7 +442,6 @@ services:
     networks: [internal]
     ports: ['4000:4000']        # proxied by Nginx on VPS-1
     env_file: ./services/auth/.env.production
-    depends_on: [redis]
 
   api:
     build: ./services/api
@@ -344,17 +461,10 @@ services:
     restart: unless-stopped
     networks: [internal]
     ports: ['3000:3000']
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    networks: [internal]
-    volumes: ['redis_data:/data']
-    command: redis-server --requirepass ${REDIS_PASSWORD}
-
-volumes:
-  redis_data:
 ```
+
+> No Redis or Postgres containers are needed on VPS-2 — all data is managed
+> through Spur Connect.
 
 ### 4.5 Secrets Management (Self-hosted)
 
@@ -366,17 +476,20 @@ For a self-hosted VPS setup without a cloud secrets manager:
   the `.env.production` files before `docker compose up -d`.
 - **Rotation** is done manually via the deployment pipeline. Add a `make rotate-secrets`
   target that re-generates keys and re-deploys.
-- **Upgrade path**: HashiCorp Vault OSS on VPS-3 when the team grows.
+- **Upgrade path**: HashiCorp Vault OSS on a dedicated node when the team grows.
 
 ### 4.6 Backups
 
-| Data         | Tool                      | Schedule      | Destination                           |
-|--------------|---------------------------|---------------|---------------------------------------|
-| PostgreSQL   | `pg_dump` via cron        | Every 6 hours | Hetzner Object Storage / S3-compatible |
-| Redis        | RDB snapshots             | Every 1 hour  | Same object storage bucket            |
-| `.env` files | Manual encrypted archive  | On rotation   | Same bucket (encrypted)               |
+Spur Connect manages the persistence and backup of all project data (PostgreSQL,
+MongoDB, MinIO). For service-level backups:
 
-Backup retention: 7 daily, 4 weekly, 3 monthly.
+| Data              | Tool                         | Schedule      | Destination                            |
+|-------------------|------------------------------|---------------|----------------------------------------|
+| `.env` files      | Manual encrypted archive     | On rotation   | Remote object storage (encrypted)      |
+| Application logs  | Log shipping via pino         | Continuous    | Centralised log store / S3-compatible  |
+
+Spur Connect backup retention and disaster recovery policies apply to all
+project data stored via the SDK.
 
 ---
 
@@ -392,7 +505,6 @@ Backup retention: 7 daily, 4 weekly, 3 monthly.
 ├── services/
 │   ├── auth/                 # The gateway — sole identity authority
 │   │   ├── src/
-│   │   │   ├── db/           # Drizzle schema + migrations
 │   │   │   ├── plugins/      # Fastify plugins (jwt, rate-limit, etc.)
 │   │   │   ├── routes/       # Endpoint handlers
 │   │   │   ├── lib/          # Token, password, MFA logic
@@ -408,14 +520,14 @@ Backup retention: 7 daily, 4 weekly, 3 monthly.
 │
 ├── packages/
 │   ├── types/                # Shared TypeScript types (Zod schemas → TS)
-│   ├── utils/                # Shared utilities (logger, env parser, etc.)
+│   ├── utils/                # Shared utilities (logger, env parser, baas client factory)
 │   └── tsconfig/             # Shared tsconfig base
 │
 ├── infra/
 │   ├── nginx/                # Nginx config files
 │   ├── docker-compose.yml    # Production compose file
 │   ├── docker-compose.dev.yml
-│   └── scripts/              # Backup, rotation, deploy scripts
+│   └── scripts/              # Rotation, deploy scripts
 │
 ├── .github/
 │   └── workflows/
@@ -424,9 +536,12 @@ Backup retention: 7 daily, 4 weekly, 3 monthly.
 │
 ├── AGENTS.md                 # ← this file
 ├── setup.bat                 # Windows dev environment bootstrap
-├── pnpm-workspace.yaml
 └── package.json
 ```
+
+> `packages/utils` exports a `createBaasClient()` factory that services import
+> instead of constructing `BaasClient` directly. This centralises config and
+> allows easy mocking in tests.
 
 ---
 
@@ -477,27 +592,29 @@ expose auth endpoints on their own domains.
 
 ## 7. Service Roles & Boundaries
 
-Each service owns its domain completely. No service may directly read or write
-another service's database.
+Each service owns its domain completely. No service may bypass Spur Connect to
+directly query another service's data, and no service may call the Spur Connect
+API using another service's project credentials.
 
 ### 7.1 `services/auth` — The Gateway
 
 **Owns:** User identities, credentials, sessions, tokens, OAuth clients.
 
-**Databases it touches:** `auth` Postgres schema, Redis (sessions + rate limits).
+**Data it touches:** `users` and `sessions` SQL tables, KV for rate limits and
+revocation records — all via `BaasClient` using the auth project's credentials.
 
 **Responsibilities:**
 - All endpoints in §6.2
 - Password hashing (Argon2id) and verification
 - TOTP enrolment and verification
 - JWT signing (EdDSA / Ed25519) and JWKS publication
-- Refresh token rotation and revocation
+- Refresh token rotation and revocation (stored as KV entries with TTL)
 - OAuth 2.0 authorisation server (PKCE only)
-- Rate limiting at the endpoint level
-- Audit log writes for all auth events
+- Rate limiting at the endpoint level (KV counters)
+- Audit log writes for all auth events (NoSQL `audit_logs` collection)
 
 **Must NOT:**
-- Read or write any other service's database tables
+- Read or write any other service's data
 - Implement business logic beyond authentication and identity
 - Store any application data (orders, posts, files, etc.)
 
@@ -507,18 +624,19 @@ another service's database.
 
 **Owns:** All application domain data.
 
-**Databases it touches:** `app` Postgres schema (separate from `auth`).
+**Data it touches:** Application SQL tables and NoSQL collections via its own
+`BaasClient` instance (separate project credentials from `services/auth`).
 
 **Responsibilities:**
 - Serve the main application API
 - Verify incoming JWTs against the gateway's JWKS (locally, no gateway call per request)
 - Enforce authorisation based on token scopes and user roles
-- Publish domain events to BullMQ for workers to consume
+- Enqueue jobs for workers via BullMQ or Spur Connect edge functions
 
 **Must NOT:**
 - Issue, refresh, or revoke tokens
 - Implement login or registration flows
-- Access the `auth` Postgres schema directly
+- Access `services/auth`'s SQL tables or KV namespace directly
 
 ---
 
@@ -529,13 +647,14 @@ another service's database.
 **Responsibilities:**
 - Consume jobs from BullMQ queues
 - Send transactional emails (via a mail provider SDK — Resend / Postmark)
-- Run scheduled maintenance tasks (prune expired tokens from DB, etc.)
+  or via `baas.functions.invoke('send-email').with({...}).call()`
+- Run scheduled maintenance tasks (prune expired records, etc.)
 - Authenticate outbound calls to the API using a service-level API key
 
 **Must NOT:**
 - Expose any HTTP endpoints (no user-facing traffic)
 - Store tokens or credentials in job payloads
-- Directly access the `auth` schema
+- Access `services/auth`'s data namespace
 
 ---
 
@@ -547,6 +666,7 @@ another service's database.
 - Login, registration, MFA, password reset, and account settings pages
 - Calls only the gateway's own API — no direct calls to `services/api`
 - Handles the OAuth consent screen
+- May use `baas.auth` (Spur Connect auth module) for project-scoped UI sessions
 
 **Must NOT:**
 - Store tokens in `localStorage` — use `httpOnly` cookies via the gateway's
@@ -652,9 +772,9 @@ email is sent.
 
 ### 9.3 Session Revocation
 
-Revocation records are stored in Redis with a TTL matching the affected token's
-remaining lifetime. Services check the revocation list on every request via a
-lightweight Redis `GET`.
+Revocation records are stored in the Spur Connect KV store with a TTL matching
+the affected token's remaining lifetime. Services check the revocation list on
+every request via `baas.kv.get(`revoked:${tokenId}`)`.
 
 | Trigger                   | Effect                                                    |
 |---------------------------|-----------------------------------------------------------|
@@ -741,7 +861,7 @@ const token = await new SignJWT({ sub: userId, scope: 'profile' })
 
 ### 11.3 Rate Limiting
 
-Implemented via `@fastify/rate-limit` backed by Redis.
+Implemented via `@fastify/rate-limit` backed by Spur Connect KV.
 
 | Endpoint                  | Limit per IP    | Limit per account |
 |---------------------------|-----------------|-------------------|
@@ -752,6 +872,8 @@ Implemented via `@fastify/rate-limit` backed by Redis.
 | All other endpoints       | 300 req / min   | —                 |
 
 Exceeding limits returns `429 Too Many Requests` with a `Retry-After` header.
+
+Rate limit counters use `baas.kv.set(key, count, { ttl: windowSeconds })`.
 
 ### 11.4 Input Validation
 
@@ -769,23 +891,31 @@ no wildcards, no substring matching.
 
 ### 11.6 Audit Logging
 
-Every authentication event is written as a structured Pino log line with at minimum:
+Every authentication event is written as a structured Pino log line **and** inserted
+into the NoSQL `audit_logs` collection via Spur Connect:
 
-```json
-{
-  "level":         "info",
-  "time":          "ISO-8601",
-  "event":         "auth.login.success",
-  "userId":        "uuid or null",
-  "ip":            "client IP",
-  "requestId":     "X-Request-ID value",
-  "outcome":       "success | failure | blocked",
-  "failureReason": "optional"
-}
+```typescript
+// Structured log (stdout → log aggregator)
+logger.info({
+  event:         'auth.login.success',
+  userId,
+  ip,
+  requestId,
+  outcome:       'success',
+})
+
+// Persistent audit record (queryable)
+await baas.nosql('audit_logs').insertOne({
+  event:    'auth.login.success',
+  userId,
+  ip,
+  requestId,
+  outcome:  'success',
+  createdAt: new Date().toISOString(),
+})
 ```
 
-Audit logs are shipped to a separate append-only log file and retained for 12 months.
-They are never written to the same stream as debug/error logs.
+Audit logs are retained for 12 months.
 
 ### 11.7 Firewall Rules (UFW)
 
@@ -798,12 +928,6 @@ They are never written to the same stream as debug/error logs.
 - Allow all from VPS-1 private IP
 - Allow 22 from your IP only
 - Deny everything else from public internet
-
-**VPS-3 (Data):**
-- Allow 5432 (Postgres) from VPS-2 private IP only
-- Allow 6379 (Redis) from VPS-2 private IP only
-- Allow 22 from your IP only
-- Deny everything else
 
 ---
 
@@ -819,16 +943,18 @@ Browser
   │                                        Zod validation
   │                                              │
   │                                    argon2.verify(hash)
+  │                                    [hash fetched via baas.db("users").getById]
   │                                              │
   │                                    Sign JWT (Ed25519)
   │                                              │
-  │                                    Store refresh in Redis
+  │                              Store refresh token: baas.kv.set(...)
   │                                              │
   │◄─ 200 { accessToken, refreshToken } ────────┘
   │
   ├─ GET /api/resource ──────────────────► API Service (VPS-2:4001)
   │   Authorization: Bearer <accessToken>        │
   │                                    jwtVerify vs JWKS cache
+  │                                    baas.kv.get(`revoked:${tokenId}`)
   │                                              │
   │◄─ 200 { data } ──────────────────────────── │
 ```
@@ -840,12 +966,12 @@ Client
   │
   ├─ POST /auth/refresh { refreshToken } ──► Gateway
   │                                              │
-  │                                     Lookup in Redis (valid?)
+  │                              baas.kv.get(`refresh:${token}`) — valid?
   │                                              │
-  │                                     Invalidate old token
+  │                              baas.kv.delete(`refresh:${oldToken}`)
   │                                              │
-  │                                     Issue new access + refresh
-  │                                     Store new refresh in Redis
+  │                              Issue new access + refresh tokens
+  │                              baas.kv.set(`refresh:${newToken}`, ...)
   │                                              │
   │◄─ 200 { accessToken, refreshToken } ────────┘
 ```
@@ -892,16 +1018,12 @@ JWT_PREV_KID=                # previous key ID during rotation (can be blank)
 ACCESS_TOKEN_TTL=900
 REFRESH_TOKEN_TTL=2592000
 
-# ── Database ──────────────────────────────────────────────────
-DATABASE_URL=postgres://auth_user:PASSWORD@VPS3-PRIVATE-IP:5432/auth
-DATABASE_POOL_MIN=2
-DATABASE_POOL_MAX=10
+# ── Spur Connect (data layer) ─────────────────────────────────
+BAAS_BASE_URL=https://bass-backend.onrender.com
+BAAS_PROJECT_ID=<your-spur-connect-project-id>
+BAAS_API_KEY=<your-spur-connect-api-key>
 
-# ── Redis ─────────────────────────────────────────────────────
-REDIS_URL=redis://:PASSWORD@VPS3-PRIVATE-IP:6379
-REDIS_KEY_PREFIX=auth:
-
-# ── Email (via worker) ────────────────────────────────────────
+# ── Email ─────────────────────────────────────────────────────
 MAIL_PROVIDER=resend          # or postmark
 MAIL_API_KEY=re_xxxxxxxxxxxx
 MAIL_FROM=noreply@yourdomain.com
@@ -923,13 +1045,23 @@ Every service must ship a `.env.example` with all keys listed (values blank or
 with safe placeholder defaults). This is committed to git. The actual `.env.production`
 is never committed.
 
-### 13.3 Key Rotation Procedure
+### 13.3 Spur Connect Credentials Per Service
+
+Each service gets its own Spur Connect project or at minimum its own API key with
+scoped permissions. Services must never share API keys. Key rotation follows the
+same pipeline procedure as JWT key rotation (see §13.4).
+
+### 13.4 Key Rotation Procedure
 
 1. Generate new Ed25519 key pair: `node infra/scripts/generate-jwk.mjs`
 2. Update `JWT_PRIVATE_KEY_BASE64` in secrets; set old `JWT_KID` as `JWT_PREV_KID`
 3. Set new `JWT_KID` to new key identifier
 4. Deploy — the gateway will serve both keys in JWKS during the grace period
 5. After 15 minutes (old token max lifetime), remove `JWT_PREV_KID`
+
+For Spur Connect API key rotation, issue a new key in the Spur Connect dashboard,
+update `BAAS_API_KEY` in GitHub Secrets, and redeploy. Revoke the old key after
+a successful deploy.
 
 ---
 
@@ -941,13 +1073,16 @@ is never committed.
 |----------------------|---------|--------------------------------------------------------------|
 | **vitest**           | 2.x     | Unit tests and integration tests                             |
 | **supertest**        | latest  | HTTP-level integration tests against a live Fastify instance |
-| **testcontainers**   | latest  | Spin up real Postgres + Redis for integration tests          |
+
+For integration tests, Spur Connect is mocked via a lightweight wrapper around
+`BaasClient` — no real database containers are required. Set `BAAS_BASE_URL` to
+a test-scoped Spur Connect project or use `vi.mock('@spurs-baas/sdk')`.
 
 Run all tests:
 
 ```bash
-pnpm test                    # all workspaces
-pnpm --filter @app/auth test # gateway only
+npm test                       # all workspaces
+npm --workspace services/auth test   # gateway only
 ```
 
 ### 14.2 Coverage Requirements
@@ -958,7 +1093,7 @@ services must maintain **≥ 80%**.
 | Test category     | What to cover                                              |
 |-------------------|------------------------------------------------------------|
 | Unit tests        | Token generation, Argon2 hashing, Zod schema validation    |
-| Integration tests | Full login / logout / refresh / OAuth flows vs real DB     |
+| Integration tests | Full login / logout / refresh / OAuth flows                |
 | Security tests    | JWT algorithm confusion, PKCE bypass, refresh token replay |
 | Rate limit tests  | 429 triggers at correct thresholds                         |
 
@@ -968,8 +1103,8 @@ Before any PR touching `/services/auth/**` is merged:
 
 - [ ] No secrets hardcoded or logged anywhere
 - [ ] All new endpoints have Zod validation schemas
-- [ ] Rate limiting applied to all new auth endpoints
-- [ ] Audit log emitted for all new auth events
+- [ ] Rate limiting applied to all new auth endpoints (KV-backed counters)
+- [ ] Audit log emitted for all new auth events (Pino + NoSQL `audit_logs`)
 - [ ] JWKS / token verification logic reviewed by a second engineer
 - [ ] Integration tests added for any new flow
 - [ ] `.env.example` updated if new variables were added
@@ -1029,6 +1164,10 @@ OAuth endpoints follow RFC 6749 error codes (`invalid_client`, `access_denied`, 
   └─ After max retries → surface error, alert on-call if production
 ```
 
+The Spur Connect SDK (`@spurs-baas/sdk`) implements automatic retry with
+exponential backoff on 429 responses (up to 3 retries). Service code does not
+need to re-implement this for BaaS calls.
+
 ---
 
 ## 16. Deployment & Operations
@@ -1036,11 +1175,11 @@ OAuth endpoints follow RFC 6749 error codes (`invalid_client`, `access_denied`, 
 ### 16.1 CI/CD Pipeline (GitHub Actions)
 
 **On every PR** (`.github/workflows/ci.yml`):
-1. `pnpm install --frozen-lockfile`
-2. `pnpm lint`
-3. `pnpm typecheck`
-4. `pnpm test` (with testcontainers for integration tests)
-5. `pnpm build` (verify all packages compile)
+1. `npm ci`
+2. `npm run lint`
+3. `npm run typecheck`
+4. `npm test` (Spur Connect SDK mocked in tests)
+5. `npm run build` (verify all packages compile)
 
 **On merge to `main`** (`.github/workflows/deploy.yml`):
 1. Run full CI suite
@@ -1080,9 +1219,8 @@ Every deploy tags images with the git SHA. Keep the last 5 images in the registr
 |------------------------------|-------------------------|------------------------------|
 | Login failure rate           | Prometheus + Grafana    | > 10% over 5 min             |
 | 5xx rate on gateway          | Prometheus + Grafana    | > 1% over 5 min              |
-| Redis memory usage           | Prometheus + Grafana    | > 80%                        |
-| Postgres connection pool     | Prometheus + Grafana    | > 90% pool utilisation       |
-| Disk usage on VPS-3          | Node exporter + Grafana | > 85%                        |
+| Spur Connect API latency p99 | Prometheus + Grafana    | > 2s over 5 min              |
+| Disk usage on VPS-2          | Node exporter + Grafana | > 85%                        |
 | TLS cert expiry              | Grafana / Certbot hook  | < 30 days                    |
 | Refresh token theft detected | Application log alert   | Any occurrence → immediate   |
 
@@ -1095,14 +1233,15 @@ Alerts route to a Slack channel or PagerDuty (your choice) via Grafana alerting.
 ```json
 {
   "status": "ok",
-  "db":     "ok",
-  "redis":  "ok",
+  "baas":   "ok",
   "uptime": 3600
 }
 ```
 
-If `db` or `redis` is `"degraded"`, the endpoint returns `503`. Nginx will stop
-routing new connections to a container returning 503.
+The `baas` field is derived from a lightweight `baas.kv.get('_healthcheck')`
+probe. If Spur Connect is unreachable, `baas` returns `"degraded"` and the
+endpoint returns `503`. Nginx will stop routing new connections to a container
+returning 503.
 
 ---
 
@@ -1129,6 +1268,8 @@ review.
 5. Update `AGENTS.md` if your change adds a new endpoint, token type, service,
    or trust boundary.
 6. Update `.env.example` for every new environment variable.
+7. Do not add direct Postgres drivers, MongoDB clients, or Redis clients to any
+   service. All data access goes through `@spurs-baas/sdk`.
 
 ### 17.3 Versioning This Document
 
@@ -1140,6 +1281,7 @@ recorded in the changelog below.
 | 1.0.0   | YYYY-MM-DD | [YOUR_NAME]      | Initial version                                  |
 | 1.1.0   | YYYY-MM-DD | [YOUR_NAME]      | Added full stack + infra detail                  |
 | 1.2.0   | YYYY-MM-DD | [YOUR_NAME]      | Pinned all package versions; added setup.bat     |
+| 1.3.0   | YYYY-MM-DD | [YOUR_NAME]      | Replaced Postgres/Redis/Drizzle with Spur Connect BaaS (`@spurs-baas/sdk`) |
 
 ---
 
