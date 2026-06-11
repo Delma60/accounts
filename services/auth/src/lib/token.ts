@@ -4,6 +4,7 @@ import {
   importJWK,
   exportJWK,
   generateKeyPair,
+  jwtVerify,
   type JWK,
   type KeyLike,
 } from 'jose'
@@ -14,6 +15,8 @@ import { getAuthEnv } from './env.js'
 
 let _privateKey: KeyLike | null = null
 let _publicJwk: JWK | null = null
+let _publicKey: KeyLike | null = null
+
 
 export async function loadSigningKey(): Promise<void> {
   const env = getAuthEnv()
@@ -21,10 +24,8 @@ export async function loadSigningKey(): Promise<void> {
   const jwk: JWK = JSON.parse(jwkJson)
   _privateKey = await importJWK(jwk, 'EdDSA') as KeyLike
 
-  // Derive public JWK from private
-  const { publicKey } = await generateKeyPair('EdDSA')
-  // We export the public portion from the private JWK by stripping 'd'
   const { d: _d, ...pubJwk } = jwk
+  _publicKey = await importJWK(pubJwk, 'EdDSA') as KeyLike
   _publicJwk = { ...pubJwk, kid: env.JWT_KID, use: 'sig', alg: 'EdDSA' }
 }
 
@@ -38,6 +39,16 @@ function getPrivateKey(): KeyLike {
   return _privateKey
 }
 
+export async function verifyAccessToken(token: string): Promise<any> {
+  const env = getAuthEnv()
+  if (!_publicKey) throw new Error('Signing key not loaded — call loadSigningKey() first')
+
+  const { payload } = await jwtVerify(token, _publicKey, {
+    issuer: env.GATEWAY_ISSUER,
+    algorithms: ['EdDSA'], // 🛡️ CRITICAL: Explicitly rejects symmetric HS256 algorithm switches
+  })
+  return payload
+}
 // ── Token signing ─────────────────────────────────────────────────────────────
 
 export interface AccessTokenClaims {

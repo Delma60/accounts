@@ -2,7 +2,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
 import { z } from 'zod'
 import crypto from 'node:crypto'
-import { signAccessToken, signIdToken, generateOpaqueToken, getPublicJwk } from '../lib/token.js'
+import { signAccessToken, signIdToken, generateOpaqueToken, getPublicJwk, verifyAccessToken } from '../lib/token.js'
 import { getAuthEnv } from '../lib/env.js'
 import type { BaasClient } from '@spurs-baas/sdk'
 import { writeAuditLog } from '../lib/audit.js'
@@ -50,8 +50,7 @@ export async function oidcRoutes(app: FastifyInstance, baas: BaasClient): Promis
     }
 
     try {
-      const [, payloadB64] = accessToken.split('.')
-      const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'))
+      const payload = await verifyAccessToken(accessToken)
       const userId = payload.sub
 
       if (!userId) {
