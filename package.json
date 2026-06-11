@@ -9,6 +9,9 @@
   ],
   "scripts": {
     "dev": "echo 'Launch local service cluster here'",
+    "dev:auth": "npm run dev --workspace=services/auth",
+    "test:auth": "npm run test --workspace=services/auth",
+    "test:auth:coverage": "npm run test:coverage --workspace=services/auth",
     "build": "npm run build --workspace packages/tsconfig && npm run build --workspace packages/types && npm run build --workspace packages/utils",
     "test": "vitest run",
     "lint": "eslint .",

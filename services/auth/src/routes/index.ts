@@ -10,7 +10,7 @@ import { logoutRoute } from './logout.js'
 import { mfaEnrollRoute, mfaVerifyRoute, mfaActivateRoute } from './mfa.js'
 import { passwordRoutes } from './password.js'
 import { oauthRoutes } from './oauth.js'
-// import { oidcRoutes } from './oidc.js'
+import { oidcRoutes } from './oidc.js'
 
 // Initialize promotional metrics registry engine
 const register = new client.Registry()

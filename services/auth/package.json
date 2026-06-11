@@ -4,7 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "db:migrate": "echo 'Running drizzle migrations vs local postgres...'"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^2.1.9"
   }
 }
