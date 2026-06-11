@@ -21,7 +21,7 @@
 - [ ] Implement `GET /auth/userinfo` and OIDC discovery endpoints
 - [ ] Publish `GET /.well-known/jwks.json` with Ed25519 public key
 - [ ] Add KV-backed rate limiting via `@fastify/rate-limit` for all auth endpoints
-- [ ] Write audit log to NoSQL `audit_logs` collection on every auth event
+- [ ] Write audit log to Sql `audit_logs` collection on every auth event
 - [ ] Implement `GET /health` endpoint with BaaS probe
 - [ ] Expose `GET /metrics` via prom-client
 - [ ] Add `infra/scripts/generate-jwk.mjs` for Ed25519 key pair generation
