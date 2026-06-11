@@ -8,10 +8,18 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "echo 'Launch local service cluster here'"
+    "dev": "echo 'Launch local service cluster here'",
+    "build": "npm run build --workspace packages/tsconfig && npm run build --workspace packages/types && npm run build --workspace packages/utils",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@spurs-baas/sdk": "^1.0.0",
     "fastify": "^5.8.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.0"
   }
 }
