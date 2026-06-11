@@ -9,5 +9,9 @@
   ],
   "scripts": {
     "dev": "echo 'Launch local service cluster here'"
+  },
+  "dependencies": {
+    "@spurs-baas/sdk": "^1.0.0",
+    "fastify": "^5.8.5"
   }
 }
