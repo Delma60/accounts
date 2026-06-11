@@ -21,33 +21,32 @@ describe('Authentication Gateway Integration Tests', () => {
     mockInsertHook = vi.fn()
     mockUpdateHook = vi.fn()
 
+    const mockDbChain: any = {
+      select: () => mockDbChain,
+      filter: () => mockDbChain,
+      limit: () => mockDbChain,
+      execute: async () => ({ data: mockDbQueryResults }),
+      insert: async (data: any) => {
+        mockInsertHook(data)
+        return { id: 'mock-user-id-999', ...data }
+      },
+      update: async (id: string, data: any) => {
+        mockUpdateHook(id, data)
+        return { id, ...data }
+      }
+    }
+
     const mockBaasClient = {
       kv: {
         get: async (key: string) => kvStore.get(key) || null,
         set: async (key: string, value: string) => { kvStore.set(key, value) },
         delete: async (key: string) => { kvStore.delete(key) },
       },
-      db: () => ({
-        select: () => ({
-          filter: () => ({
-            limit: () => ({
-              execute: async () => ({ data: mockDbQueryResults })
-            })
-          })
-        }),
-        insert: async (data: any) => {
-          mockInsertHook(data)
-          return { id: 'mock-user-id-999', ...data }
-        },
-        update: async (id: string, data: any) => {
-          mockUpdateHook(id, data)
-          return { id, ...data }
-        }
-      })
+      db: () => mockDbChain
     }
 
-    app = await buildAuthApp()
-    app.baas = mockBaasClient
+    app = await buildAuthApp(mockBaasClient)
+    // app.baas = mockBaasClient
   })
 
   // ── REGISTER FLOW TESTS ───────────────────────────────────────────────────
