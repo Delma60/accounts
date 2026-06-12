@@ -1,6 +1,6 @@
 // services/api/src/plugins/index.ts
 import type { FastifyInstance } from 'fastify'
-import { createBaasClient } from '@app/utils'
+// import { createBaasClient } from '@app/utils'
 import { registerAuthPlugin } from './auth.js'
 
 export async function registerPlugins(app: FastifyInstance): Promise<void> {

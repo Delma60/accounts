@@ -46,9 +46,9 @@
 ## services/api
 
 - [x] Scaffold Fastify app entry point
-- [ ] Integrate `verifyToken()` from `packages/utils` to validate JWTs on every request
-- [ ] Enforce authorisation based on token scopes and user roles
-- [ ] Wire `BaasClient` using `createBaasClient()` from `packages/utils`
+- [x] Integrate `verifyToken()` from `packages/utils` to validate JWTs on every request
+- [x] Enforce authorisation based on token scopes and user roles
+- [x] Wire `BaasClient` using `createBaasClient()` from `packages/utils`
 - [ ] Implement job enqueueing via BullMQ or `baas.functions` for async work
 - [ ] Write integration tests (≥ 80% coverage)
 

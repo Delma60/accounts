@@ -6,7 +6,7 @@ import { BaasClient } from '@spurs-baas/sdk'
 export async function buildAuthApp(customBaas?: any) {
   const app = Fastify({ logger: true })
 
-  const baas = new BaasClient({
+  const baas = customBaas || new BaasClient({
     projectId: process.env.BAAS_PROJECT_ID!,
     apiKey: process.env.BAAS_API_KEY!,
     baseUrl: process.env.BAAS_BASE_URL,
