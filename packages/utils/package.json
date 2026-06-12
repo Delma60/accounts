@@ -1,5 +1,8 @@
 {
   "name": "@app/utils",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "@spurs-baas/sdk": "^1.0.3"
+  }
 }

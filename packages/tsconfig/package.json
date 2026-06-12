@@ -6,5 +6,8 @@
     "base.json",
     "service.json",
     "nextjs.json"
-  ]
+  ],
+  "dependencies": {
+    "@spurs-baas/sdk": "^1.0.3"
+  }
 }

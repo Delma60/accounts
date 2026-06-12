@@ -11,5 +11,8 @@
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^2.1.9"
+  },
+  "dependencies": {
+    "@spurs-baas/sdk": "^1.0.3"
   }
 }

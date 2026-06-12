@@ -8,6 +8,8 @@ import { useState, type ReactNode } from 'react'
 export function Providers({ children }: { children: ReactNode }) {
   // One QueryClient per browser session — not a module-level singleton
   // so server-side renders stay isolated between requests
+//   const baasClient = createBaasClient()
+
   const [queryClient] = useState(
     () =>
       new QueryClient({

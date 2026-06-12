@@ -2,5 +2,8 @@
   "name": "@app/api",
   "version": "1.0.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "@spurs-baas/sdk": "^1.0.3"
+  }
 }
