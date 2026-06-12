@@ -2,3 +2,5 @@
 **/*.ts.html
 **/*.html
 **/*.next
+**/*.env
+**/types/dist/**
