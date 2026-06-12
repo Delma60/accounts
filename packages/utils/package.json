@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "@spurs-baas/sdk": "^1.0.3"
+    "@spurs-baas/sdk": "^1.0.3",
+    "bullmq": "^5.78.0"
   }
 }

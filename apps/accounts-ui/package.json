@@ -11,9 +11,11 @@
   },
   "dependencies": {
     "@app/types": "*",
+    "@app/utils": "^1.0.0",
     "@spurs-baas/sdk": "^1.0.3",
     "@tanstack/react-query": "^5.62.3",
     "@tanstack/react-query-devtools": "^5.62.3",
+    "bullmq": "^5.78.0",
     "next": "^15.3.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

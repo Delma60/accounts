@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@spurs-baas/sdk": "^1.0.3",
+    "bullmq": "^5.78.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
