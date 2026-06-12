@@ -1,5 +1,31 @@
 {
   "name": "@app/accounts-ui",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@app/types": "*",
+    "@spurs-baas/sdk": "^1.0.0",
+    "@tanstack/react-query": "^5.62.3",
+    "@tanstack/react-query-devtools": "^5.62.3",
+    "next": "^15.3.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@app/tsconfig": "*",
+    "@tailwindcss/postcss": "^4.1.10",
+    "@types/node": "^25.9.3",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "tailwindcss": "^4.1.10",
+    "typescript": "^5.5.4"
+  }
 }
