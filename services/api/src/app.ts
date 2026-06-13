@@ -14,7 +14,7 @@ function getBaasClient(): BaasClient {
   const apiKey    = process.env.BAAS_API_KEY
   if (!projectId) throw new Error('BAAS_PROJECT_ID is required but was not set.')
   if (!apiKey)    throw new Error('BAAS_API_KEY is required but was not set.')
-  _baasInstance = new BaasClient({ projectId, apiKey, baseUrl: process.env.BAAS_BASE_URL })
+  _baasInstance = new BaasClient({ projectId, apiKey, baseUrl: process.env.BAAS_BASE_URL, timeout: 90_000 })
   return _baasInstance
 }
 

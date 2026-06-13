@@ -37,6 +37,12 @@ export async function checkRateLimit(
     return { allowed: false, retryAfter: cfg.windowSeconds }
   }
 
-  await baas.kv.set(kvKey, String(current + 1), { ttl: cfg.windowSeconds })
+  try {
+    await baas.kv.set(kvKey, String(current + 1), { ttl: cfg.windowSeconds })
+  } catch (err) {
+    // Log the warning internally, but let the client request proceed
+    // request.log.warn({ err }, 'Rate limit increment failed')
+    console.warn(`[RateLimit] Failed to increment counter for key ${kvKey}:`, err)
+  }
   return { allowed: true }
 }

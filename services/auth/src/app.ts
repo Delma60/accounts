@@ -10,6 +10,7 @@ export async function buildAuthApp(customBaas?: any) {
     projectId: process.env.BAAS_PROJECT_ID!,
     apiKey: process.env.BAAS_API_KEY!,
     baseUrl: process.env.BAAS_BASE_URL,
+    timeout: 90_000
   })
 
   ;(app as any).baas = baas

@@ -28,7 +28,7 @@ export function createBaasClient(options: BaasClientOptions = {}): BaasClient {
   if (!projectId) throw new Error('BAAS_PROJECT_ID is required but was not set.')
   if (!apiKey)    throw new Error('BAAS_API_KEY is required but was not set.')
 
-  _instance = new BaasClient({ projectId, apiKey, baseUrl })
+  _instance = new BaasClient({ projectId, apiKey, baseUrl, timeout: 90_000 })
   return _instance
 }
 
