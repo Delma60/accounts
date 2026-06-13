@@ -1,0 +1,64 @@
+# .github/workflows/cross-sdk-integration.yml
+#
+# Cross-SDK Integration Test — per todo.md §shared
+#
+# Runs the full OAuth 2.0 / PKCE flow against a live services/auth instance
+# using the JS and Python SDK simulation paths in tests/cross-sdk/run-oauth-flow.mjs.
+#
+# When to run:
+#   - On push to main (post-merge gate)
+#   - On any PR that touches services/auth routes or the cross-sdk test
+#   - Manually via workflow_dispatch
+#
+# The test script starts services/auth itself (mocked BaaS, no external deps),
+# runs every flow twice (once labelled "JS SDK", once "Python SDK"), then tears
+# the service down. No Docker, no Postgres, no Redis required.
+
+name: Cross-SDK Integration Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/auth/src/**"
+      - "tests/cross-sdk/**"
+      - "docs/api-contract.yaml"
+  pull_request:
+    paths:
+      - "services/auth/src/**"
+      - "tests/cross-sdk/**"
+  workflow_dispatch:
+
+jobs:
+  cross-sdk:
+    name: OAuth/PKCE cross-SDK flow
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install monorepo dependencies
+        run: npm ci
+
+      - name: Build shared packages (types, utils)
+        run: npm run build
+
+      - name: Run cross-SDK integration test
+        # START_SERVICE=true  → the script spawns services/auth internally
+        # The script handles its own teardown on exit.
+        run: START_SERVICE=true node tests/cross-sdk/run-oauth-flow.mjs
+        timeout-minutes: 5
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-sdk-failure-log
+          path: /tmp/auth-service-*.log
+          retention-days: 7

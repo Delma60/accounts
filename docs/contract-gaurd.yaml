@@ -1,0 +1,245 @@
+# .github/workflows/contract-guard.yml
+#
+# Contract Guard — per AGENTS.md §17 (Contribution & Change Protocol)
+#
+# Runs on every PR that touches:
+#   - services/auth/src/routes/**   (gateway route implementations)
+#   - docs/api-contract.yaml        (the contract itself)
+#   - packages/types/src/**         (Zod schemas that mirror contract shapes)
+#
+# Three checks:
+#   1. Lint the OpenAPI YAML (valid 3.1, no dangling $refs)
+#   2. Diff contract operationIds vs registered route paths in source
+#   3. Enforce a version bump when operationIds change between base and PR branch
+
+name: API Contract Guard
+
+on:
+  pull_request:
+    paths:
+      - "services/auth/src/routes/**"
+      - "docs/api-contract.yaml"
+      - "packages/types/src/**"
+  # Allow manual runs for debugging
+  workflow_dispatch:
+
+jobs:
+  contract-guard:
+    name: Validate API contract
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history needed so we can read the base-branch contract version
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # ── 1. Install tooling ──────────────────────────────────────────────────
+      - name: Install script dependencies
+        run: |
+          # js-yaml + glob for the inline Node scripts below
+          npm install --no-save js-yaml glob
+          # Redocly CLI for OpenAPI linting
+          npm install --no-save @redocly/cli
+
+      # ── 2. Lint the OpenAPI document ────────────────────────────────────────
+      - name: Lint docs/api-contract.yaml (OpenAPI 3.1)
+        run: |
+          npx @redocly/cli lint docs/api-contract.yaml \
+            --extends recommended \
+            --format stylish
+        # Hard failure if the YAML is malformed, has broken $refs, or violates
+        # the recommended OpenAPI ruleset.
+
+      # ── 3. Diff contract paths vs gateway source routes ─────────────────────
+      - name: Check contract paths match source route registrations
+        run: |
+          node - <<'SCRIPT'
+          const fs   = require('fs')
+          const yaml = require('js-yaml')
+          const glob = require('glob').sync
+
+          // ── Parse contract paths ──────────────────────────────────────────
+          const raw = fs.readFileSync('docs/api-contract.yaml', 'utf8')
+          const doc = yaml.load(raw)
+
+          // Normalise OpenAPI {param} → :param so we can compare with Express-style source
+          const contractRoutes = new Set(
+            Object.entries(doc.paths ?? {}).flatMap(([path, methods]) =>
+              Object.keys(methods)
+                .filter(m => ['get','post','put','patch','delete'].includes(m))
+                .map(m => `${m.toUpperCase()} ${path.replace(/\{([^}]+)\}/g, ':$1')}`)
+            )
+          )
+
+          // ── Scrape route registrations from source ────────────────────────
+          // Matches: app.get('/some/path', ...) — captures method + path literal
+          const METHOD_RE = /app\.(get|post|put|delete|patch)\(\s*['"`]([^'"`]+)['"`]/g
+          const sourceRoutes = new Set()
+
+          for (const file of glob('services/auth/src/routes/**/*.ts')) {
+            const src = fs.readFileSync(file, 'utf8')
+            let m
+            while ((m = METHOD_RE.exec(src)) !== null) {
+              sourceRoutes.add(`${m[1].toUpperCase()} ${m[2]}`)
+            }
+          }
+
+          // Paths the contract documents that are always implemented by the
+          // framework / plugins rather than explicit route files
+          const IMPLICIT = new Set([
+            'GET /health',
+            'GET /metrics',
+            'GET /.well-known/jwks.json',
+            'GET /.well-known/openid-configuration',
+          ])
+
+          // ── Routes in source but absent from contract ─────────────────────
+          const undocumented = [...sourceRoutes].filter(r => {
+            // Convert Express :param → {param} for contract lookup
+            const oapiForm = r.replace(/:([a-zA-Z_]+)/g, '{$1}')
+            const [method, path] = oapiForm.split(' ')
+            return !contractRoutes.has(r) && !contractRoutes.has(`${method} ${path}`)
+          })
+
+          // ── Contract paths missing from source ────────────────────────────
+          // (warning only — endpoints may be partially scaffolded)
+          const stale = [...contractRoutes].filter(r => {
+            if (IMPLICIT.has(r)) return false
+            const expressForm = r.replace(/\{([^}]+)\}/g, ':$1')
+            return !sourceRoutes.has(r) && !sourceRoutes.has(expressForm)
+          })
+
+          let failed = false
+
+          if (undocumented.length > 0) {
+            console.error('\n❌  Routes registered in services/auth but MISSING from docs/api-contract.yaml:')
+            undocumented.forEach(r => console.error('     ' + r))
+            console.error('\n   Add these to docs/api-contract.yaml and bump info.version.\n')
+            failed = true
+          }
+
+          if (stale.length > 0) {
+            console.warn('\n⚠️   Paths in docs/api-contract.yaml with no matching route in source:')
+            stale.forEach(r => console.warn('     ' + r))
+            console.warn('\n   Either implement the route or remove the stale contract entry.\n')
+            // Treat as warning, not hard failure, to allow spec-first development.
+          }
+
+          if (!failed) {
+            console.log('\n✅  All source routes are documented in the contract.\n')
+          } else {
+            process.exit(1)
+          }
+          SCRIPT
+
+      # ── 4. Enforce version bump when operationIds change ────────────────────
+      - name: Check info.version is bumped when operationIds change
+        run: |
+          node - <<'SCRIPT'
+          const { execSync } = require('child_process')
+          const fs   = require('fs')
+          const yaml = require('js-yaml')
+
+          const BASE = process.env.GITHUB_BASE_REF ?? 'main'
+
+          // Read contract on base branch (may not exist on first PR)
+          let baseYaml = ''
+          try {
+            baseYaml = execSync(`git show origin/${BASE}:docs/api-contract.yaml`, { encoding: 'utf8' })
+          } catch {
+            console.log('Base branch has no contract yet — skipping version bump check.')
+            process.exit(0)
+          }
+
+          const basDoc = yaml.load(baseYaml)
+          const prDoc  = yaml.load(fs.readFileSync('docs/api-contract.yaml', 'utf8'))
+
+          const baseVersion = basDoc?.info?.version ?? '0.0.0'
+          const prVersion   = prDoc?.info?.version  ?? '0.0.0'
+
+          // Collect operationIds from each
+          function extractOps(doc) {
+            const ops = []
+            for (const methods of Object.values(doc?.paths ?? {})) {
+              for (const op of Object.values(methods)) {
+                if (op?.operationId) ops.push(op.operationId)
+              }
+            }
+            return ops.sort().join('\n')
+          }
+
+          const baseOps = extractOps(basDoc)
+          const prOps   = extractOps(prDoc)
+
+          console.log(`Base branch version : ${baseVersion}`)
+          console.log(`PR branch version   : ${prVersion}`)
+
+          if (baseOps !== prOps && baseVersion === prVersion) {
+            console.error('\n❌  operationIds changed but info.version was not bumped.')
+            console.error(`   Base: ${baseVersion}  →  PR: ${prVersion}  (unchanged)`)
+            console.error('\n   Please:')
+            console.error('   1. Update info.version in docs/api-contract.yaml')
+            console.error('   2. Add a line to the CHANGELOG block at the top of that file\n')
+
+            // Show what changed
+            const baseSet = new Set(baseOps.split('\n'))
+            const prSet   = new Set(prOps.split('\n'))
+            const added   = [...prSet].filter(o => !baseSet.has(o))
+            const removed = [...baseSet].filter(o => !prSet.has(o))
+            if (added.length)   console.error('   Added   :', added.join(', '))
+            if (removed.length) console.error('   Removed :', removed.join(', '))
+            console.error()
+
+            process.exit(1)
+          }
+
+          if (baseOps !== prOps) {
+            console.log(`✅  operationIds changed and version was bumped: ${baseVersion} → ${prVersion}`)
+          } else {
+            console.log('✅  No operationId changes detected — version bump not required.')
+          }
+          SCRIPT
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+
+      # ── 5. Verify packages/types exports align with contract schemas ─────────
+      - name: Check packages/types Zod schemas cover contract response shapes
+        run: |
+          node - <<'SCRIPT'
+          const fs   = require('fs')
+          const yaml = require('js-yaml')
+
+          const doc = yaml.load(fs.readFileSync('docs/api-contract.yaml', 'utf8'))
+          const schemaNames = Object.keys(doc.components?.schemas ?? {})
+
+          // Read all type source files
+          const typeSrc = [
+            'packages/types/src/user.ts',
+            'packages/types/src/token.ts',
+            'packages/types/src/errors.ts',
+          ].map(f => { try { return fs.readFileSync(f, 'utf8') } catch { return '' } }).join('\n')
+
+          // Schemas that intentionally have no Zod counterpart
+          const SKIP = new Set(['JwksResponse', 'OidcConfiguration'])
+
+          const missing = schemaNames.filter(name => {
+            if (SKIP.has(name)) return false
+            return !typeSrc.includes(`${name}Schema`)
+          })
+
+          if (missing.length > 0) {
+            console.warn('\n⚠️   Contract schemas with no matching Zod export in packages/types:')
+            missing.forEach(n => console.warn(`    ${n}  →  expected export: ${n}Schema`))
+            console.warn('\n   Consider adding these to packages/types/src.\n')
+            // Warning only — new schemas may be added to the contract before the
+            // Zod types are wired up. Flip to process.exit(1) to make it strict.
+          } else {
+            console.log('✅  All contract schemas have a matching Zod export in packages/types.\n')
+          }
+          SCRIPT

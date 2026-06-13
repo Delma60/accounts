@@ -1,0 +1,739 @@
+# docs/api-contract.yaml
+#
+# Gateway API Contract — canonical source of truth for:
+#   - packages/sdk-js      (JS/TS client)
+#   - packages/sdk-python  (Python client)
+#   - packages/types       (Zod schemas must match these shapes)
+#
+# ┌─ CHANGE RULES ────────────────────────────────────────────────────────────┐
+# │  Any change to a path, method, operationId, request body, or response    │
+# │  shape in services/auth MUST be reflected here FIRST.                    │
+# │                                                                           │
+# │  Bump info.version:                                                       │
+# │    • MAJOR — removed/renamed field, changed status code, removed path    │
+# │    • MINOR — new endpoint, new optional field, new response property      │
+# │    • PATCH — description-only edits, example updates                     │
+# │                                                                           │
+# │  CI (.github/workflows/contract-guard.yml) FAILS a PR if                 │
+# │  operationIds/paths change without a version bump here.                  │
+# └───────────────────────────────────────────────────────────────────────────┘
+#
+# CHANGELOG
+# ─────────
+# 1.0.0  Initial contract. Auth, MFA, password reset, OAuth 2.0/PKCE, OIDC.
+
+openapi: "3.1.0"
+
+info:
+  title: Gateway Auth API
+  version: "1.0.0"
+  description: |
+    The accounts gateway is the sole identity authority for the platform
+    (AGENTS.md §6). Every downstream service trusts only tokens issued here.
+
+    **Tokens**
+
+    | Type          | Format | Lifetime | Notes                            |
+    |---------------|--------|----------|----------------------------------|
+    | Access token  | JWT    | 15 min   | Ed25519/EdDSA signed             |
+    | Refresh token | opaque | 30 days  | Rotated on every use             |
+    | ID token      | JWT    | 1 hour   | OIDC claims                      |
+
+    HS256 is explicitly rejected at every verification point.
+
+servers:
+  - url: https://accounts.yourdomain.com
+    description: Production
+  - url: https://accounts.staging.yourdomain.com
+    description: Staging
+  - url: http://localhost:4000
+    description: Local dev
+
+components:
+  securitySchemes:
+    BearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Ed25519-signed JWT in the Authorization header.
+    CookieAccessToken:
+      type: apiKey
+      in: cookie
+      name: access_token
+      description: httpOnly cookie set by the gateway on login.
+
+  schemas:
+
+    # → packages/types/src/errors.ts  ErrorResponseSchema
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:             { type: string,      example: invalid_credentials }
+        error_description: { type: string,      example: The email or password is incorrect. }
+        request_id:        { type: string,      format: uuid }
+
+    # → packages/types/src/user.ts  UserSchema
+    User:
+      type: object
+      required: [id, email, status, mfaEnabled, createdAt, updatedAt]
+      properties:
+        id:         { type: string,  format: uuid }
+        email:      { type: string,  format: email }
+        name:       { type: string,  nullable: true }
+        status:     { type: string,  enum: [active, suspended, pending_verification] }
+        mfaEnabled: { type: boolean }
+        createdAt:  { type: string,  format: date-time }
+        updatedAt:  { type: string,  format: date-time }
+
+    # → packages/types/src/user.ts  LoginSuccessResponseSchema
+    TokenResponse:
+      type: object
+      required: [accessToken, refreshToken, expiresIn, tokenType]
+      properties:
+        accessToken:  { type: string }
+        refreshToken: { type: string }
+        expiresIn:    { type: integer, description: Seconds until access token expiry. Default 900. }
+        tokenType:    { type: string,  enum: [Bearer] }
+
+    # → packages/types/src/user.ts  MfaChallengeResponseSchema
+    MfaChallengeResponse:
+      type: object
+      required: [challengeId, type]
+      properties:
+        challengeId: { type: string, format: uuid }
+        type:        { type: string, enum: [totp] }
+
+    # → packages/types/src/token.ts  MfaEnrollResponseSchema
+    MfaEnrollResponse:
+      type: object
+      required: [secret, otpauthUrl, backupCodes]
+      properties:
+        secret:      { type: string, description: Base32 TOTP secret — shown once. }
+        otpauthUrl:  { type: string, description: "otpauth:// URI for QR rendering." }
+        backupCodes: { type: array,  items: { type: string }, minItems: 8 }
+
+    # → packages/types/src/token.ts  OAuthTokenResponseSchema
+    OAuthTokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in, scope]
+      properties:
+        access_token:  { type: string }
+        token_type:    { type: string, enum: [Bearer] }
+        expires_in:    { type: integer }
+        refresh_token: { type: string }
+        id_token:      { type: string }
+        scope:         { type: string }
+
+    # → packages/types/src/token.ts  UserInfoResponseSchema
+    UserInfoResponse:
+      type: object
+      required: [sub, email, email_verified]
+      properties:
+        sub:            { type: string,  format: uuid }
+        email:          { type: string,  format: email }
+        email_verified: { type: boolean }
+        name:           { type: string,  nullable: true }
+        picture:        { type: string,  format: uri, nullable: true }
+
+    # No Zod counterpart needed — served as-is via jose
+    JwksResponse:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            description: RFC 8037 OKP JWK (Ed25519 public key, no private material).
+            required: [kty, crv, alg, use, kid, x]
+            properties:
+              kty: { type: string, enum: [OKP] }
+              crv: { type: string, enum: [Ed25519] }
+              alg: { type: string, enum: [EdDSA] }
+              use: { type: string, enum: [sig] }
+              kid: { type: string }
+              x:   { type: string, description: Base64url-encoded public key bytes. }
+
+    OidcConfiguration:
+      type: object
+      required:
+        - issuer
+        - authorization_endpoint
+        - token_endpoint
+        - userinfo_endpoint
+        - jwks_uri
+        - response_types_supported
+        - subject_types_supported
+        - id_token_signing_alg_values_supported
+      properties:
+        issuer:                                { type: string, format: uri }
+        authorization_endpoint:                { type: string, format: uri }
+        token_endpoint:                        { type: string, format: uri }
+        userinfo_endpoint:                     { type: string, format: uri }
+        jwks_uri:                              { type: string, format: uri }
+        scopes_supported:                      { type: array, items: { type: string } }
+        response_types_supported:              { type: array, items: { type: string } }
+        subject_types_supported:               { type: array, items: { type: string } }
+        id_token_signing_alg_values_supported: { type: array, items: { type: string } }
+        claims_supported:                      { type: array, items: { type: string } }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid access token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: Valid token but insufficient scope or suspended account.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    TooManyRequests:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds until the client may retry.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ServiceUnavailable:
+      description: Gateway or BaaS backend temporarily unavailable.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+paths:
+
+  # ── System ──────────────────────────────────────────────────────────────────
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Health check with live BaaS probe
+      tags: [System]
+      responses:
+        "200":
+          description: Gateway is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:   { type: string, enum: [ok, error] }
+                  services: { type: object, additionalProperties: { type: string } }
+        "503": { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus scrape endpoint (internal — blocked at Nginx for public traffic)
+      tags: [System]
+      responses:
+        "200":
+          description: Prometheus text format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+  # ── OIDC discovery ───────────────────────────────────────────────────────────
+
+  /.well-known/jwks.json:
+    get:
+      operationId: getJwks
+      summary: JWKS — Ed25519 public key(s) for downstream token verification
+      description: |
+        Downstream services fetch this once at startup and cache via
+        jose's `createRemoteJWKSet` (AGENTS.md §8.3). Only EdDSA keys
+        are published; HS256 is never served here.
+      tags: [OIDC]
+      responses:
+        "200":
+          description: JWKS document.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JwksResponse' }
+
+  /.well-known/openid-configuration:
+    get:
+      operationId: getOidcConfiguration
+      summary: OpenID Connect discovery document (RFC 8414)
+      tags: [OIDC]
+      responses:
+        "200":
+          description: OIDC configuration.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OidcConfiguration' }
+
+  /auth/userinfo:
+    get:
+      operationId: getUserInfo
+      summary: Return OIDC identity claims for the bearer's access token
+      tags: [OIDC]
+      security:
+        - BearerToken: []
+        - CookieAccessToken: []
+      responses:
+        "200":
+          description: Identity claims.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserInfoResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ── Auth ─────────────────────────────────────────────────────────────────────
+
+  /auth/register:
+    post:
+      operationId: register
+      summary: Create a new user account
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 12
+                  maxLength: 128
+                  description: Hashed with Argon2id before storage. Never logged.
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+      responses:
+        "201":
+          description: Account created. Email verification required before first login.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, message]
+                properties:
+                  user:    { $ref: '#/components/schemas/User' }
+                  message: { type: string }
+        "400":
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "409":
+          description: Email already registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "429": { $ref: '#/components/responses/TooManyRequests' }
+        "503": { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/login:
+    post:
+      operationId: login
+      summary: Authenticate with email and password
+      description: |
+        Returns **200** + tokens when no MFA is enrolled.
+        Returns **202** + a `challengeId` when MFA is required — the client
+        must follow up with POST /auth/mfa/verify to complete login.
+
+        Tokens are placed in the response body **and** set as
+        `httpOnly; Secure; SameSite=Strict` cookies. Browser clients use
+        the cookies; API/SDK clients use the body.
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:    { type: string, format: email }
+                password: { type: string, minLength: 1 }
+      responses:
+        "200":
+          description: Login successful. Tokens in body and httpOnly cookies.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        "202":
+          description: MFA required. Proceed to POST /auth/mfa/verify.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MfaChallengeResponse' }
+        "400":
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401":
+          description: Invalid credentials.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "403":
+          description: Account suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "429": { $ref: '#/components/responses/TooManyRequests' }
+        "503": { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/logout:
+    post:
+      operationId: logout
+      summary: Revoke refresh token and clear session cookies
+      tags: [Auth]
+      security:
+        - BearerToken: []
+        - CookieAccessToken: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken:
+                  type: string
+                  description: Omit when using the httpOnly refresh_token cookie.
+      responses:
+        "200":
+          description: Session invalidated. Cookies cleared.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+
+  /auth/refresh:
+    post:
+      operationId: refreshToken
+      summary: Rotate the refresh token and issue a new access token
+      description: |
+        Every use produces a new refresh token and invalidates the old one.
+        Replaying a consumed token triggers full session revocation for the
+        affected user (AGENTS.md §9.2).
+      tags: [Auth]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken:
+                  type: string
+                  description: Omit when the httpOnly refresh_token cookie is present.
+      responses:
+        "200":
+          description: New token pair. Old refresh token is now invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        "400":
+          description: Missing refresh token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401":
+          description: Token invalid, expired, or detected as replayed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "403":
+          description: Account suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "429": { $ref: '#/components/responses/TooManyRequests' }
+        "503": { $ref: '#/components/responses/ServiceUnavailable' }
+
+  # ── MFA ──────────────────────────────────────────────────────────────────────
+
+  /auth/mfa/enroll:
+    post:
+      operationId: mfaEnroll
+      summary: Begin TOTP enrolment — returns secret and backup codes
+      description: |
+        Stores a pending secret in KV with a 5-minute TTL. The client must
+        call POST /auth/mfa/activate with a valid TOTP code to persist MFA.
+        Secrets not confirmed within 5 minutes are discarded.
+      tags: [MFA]
+      security:
+        - BearerToken: []
+        - CookieAccessToken: []
+      responses:
+        "200":
+          description: TOTP secret and QR URI. Display to the user exactly once.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MfaEnrollResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "409":
+          description: MFA already enabled on this account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "503": { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/mfa/verify:
+    post:
+      operationId: mfaVerify
+      summary: Verify TOTP code to complete a post-login MFA challenge
+      tags: [MFA]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challengeId, code]
+              properties:
+                challengeId:
+                  type: string
+                  format: uuid
+                  description: The challengeId from the POST /auth/login 202 response.
+                code:
+                  type: string
+                  pattern: '^\d{6}$'
+      responses:
+        "200":
+          description: MFA verified. Full token pair issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResponse' }
+        "400":
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401":
+          description: Challenge not found/expired, or TOTP code invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "403":
+          description: Account suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "503": { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /auth/mfa/activate:
+    post:
+      operationId: mfaActivate
+      summary: Confirm TOTP enrolment with the first code — enables MFA on the account
+      tags: [MFA]
+      security:
+        - BearerToken: []
+        - CookieAccessToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, pattern: '^\d{6}$' }
+      responses:
+        "200":
+          description: MFA is now active.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+        "400":
+          description: No pending enrolment, or TOTP code invalid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401": { $ref: '#/components/responses/Unauthorized' }
+        "503": { $ref: '#/components/responses/ServiceUnavailable' }
+
+  # ── Password reset ────────────────────────────────────────────────────────────
+
+  /auth/password/forgot:
+    post:
+      operationId: forgotPassword
+      summary: Request a password reset link
+      description: |
+        Always returns 200 regardless of whether the email exists
+        (anti-enumeration). If matched, a signed reset token is stored in KV
+        for 15 minutes and an email job is enqueued via the worker.
+      tags: [Password]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        "200":
+          description: Response is always identical regardless of account existence.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+        "400":
+          description: Validation error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "429": { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/password/reset:
+    post:
+      operationId: resetPassword
+      summary: Set a new password using a valid reset token
+      description: |
+        The reset token is single-use and deleted from KV immediately on
+        success. All active sessions for the user are revoked as a side-effect.
+      tags: [Password]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token:    { type: string, minLength: 1 }
+                password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "200":
+          description: Password updated. User may now log in with the new password.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message: { type: string }
+        "400":
+          description: Token invalid/expired, or password too weak.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "500":
+          description: Internal error during credential update.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ── OAuth 2.0 / PKCE ─────────────────────────────────────────────────────────
+
+  /auth/oauth/authorize:
+    get:
+      operationId: oauthAuthorize
+      summary: Start an OAuth 2.0 authorization code + PKCE flow
+      description: |
+        The user must be authenticated (valid session cookie). If not, the
+        gateway returns 401 and the client should redirect to the login page.
+
+        Only `response_type=code` with `code_challenge_method=S256` is
+        accepted. The implicit flow is permanently disabled (AGENTS.md §8.2).
+      tags: [OAuth]
+      parameters:
+        - { name: response_type,         in: query, required: true,  schema: { type: string, enum: [code] } }
+        - { name: client_id,             in: query, required: true,  schema: { type: string } }
+        - { name: redirect_uri,          in: query, required: true,  schema: { type: string, format: uri } }
+        - { name: code_challenge,        in: query, required: true,  schema: { type: string } }
+        - { name: code_challenge_method, in: query, required: true,  schema: { type: string, enum: [S256] } }
+        - { name: scope,                 in: query, required: false, schema: { type: string, default: 'openid profile email' } }
+        - { name: state,                 in: query, required: false, schema: { type: string } }
+      responses:
+        "302":
+          description: |
+            Redirects to `redirect_uri?code=AUTH_CODE&state=STATE` on approval,
+            or `redirect_uri?error=access_denied&...` on denial (RFC 6749 §4.1.2).
+        "400":
+          description: Invalid query parameters.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "401":
+          description: User not authenticated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /auth/oauth/token:
+    post:
+      operationId: oauthToken
+      summary: Exchange an authorization code for tokens (PKCE S256 verified)
+      description: |
+        The authorization code is single-use — deleted from KV immediately on
+        successful exchange. PKCE code_verifier is checked against the stored
+        code_challenge using SHA-256 (S256). Plain method is not supported.
+      tags: [OAuth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grant_type, client_id, redirect_uri, code, code_verifier]
+              properties:
+                grant_type:    { type: string, enum: [authorization_code] }
+                client_id:     { type: string }
+                redirect_uri:  { type: string, format: uri, description: Must exactly match the URI used in /auth/oauth/authorize. }
+                code:          { type: string }
+                code_verifier: { type: string, minLength: 43, maxLength: 128 }
+      responses:
+        "200":
+          description: Token exchange successful.
+          headers:
+            Cache-Control: { schema: { type: string }, example: no-store }
+            Pragma:        { schema: { type: string }, example: no-cache }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthTokenResponse' }
+        "400":
+          description: Invalid grant — code not found/expired, PKCE failure, or parameter mismatch.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        "500":
+          description: Internal error.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+tags:
+  - name: System
+    description: Health and observability.
+  - name: OIDC
+    description: OpenID Connect discovery, JWKS, and UserInfo.
+  - name: Auth
+    description: Registration, login, logout, and token refresh.
+  - name: MFA
+    description: TOTP enrolment, activation, and verification.
+  - name: Password
+    description: Password reset request and confirmation.
+  - name: OAuth
+    description: "OAuth 2.0 authorization server (PKCE only — implicit flow disabled)."
